@@ -1,0 +1,1181 @@
+'use strict';
+
+// Global State
+const state = {
+  students: [],
+  examSchedule: [],
+  departments: [],
+  currentDept: null,
+  currentDate: null,
+  currentSubject: null,
+  attendanceData: [],
+  loaded: false
+};
+
+
+// Department-wise Attendance Excel (one sheet per department for selected date)
+function downloadDeptAttendanceExcel() {
+  const selectedDate = el.dateSelect.value;
+  if (!selectedDate) { alert('Select a date first.'); return; }
+  if (!state.allocations.length) { alert('No allocations available. Allocate first.'); return; }
+
+  // Build department -> subjects on selected date
+  const examsOnDate = state.exams.filter(e => e.Date === selectedDate);
+  const deptToSubjects = examsOnDate.reduce((acc, e) => {
+    const d = normalizeDeptName(e.Dept || inferDeptFromSubject(e.SubjectCode));
+    if (!d) return acc;
+    (acc[d] ||= new Map()).set(e.SubjectCode, e.SubjectName || e.SubjectCode);
+    return acc;
+  }, {});
+  const departments = Object.keys(deptToSubjects).sort();
+  if (departments.length === 0) { alert('No departments found for selected date.'); return; }
+
+  const regToStudent = new Map(state.students.map(s => [s.RegNo, s]));
+  const regsAll = new Set();
+  state.allocations.forEach(a => flattenGrid(a.seats).forEach(r => { if (r) regsAll.add(r); }));
+
+  const wb = XLSX.utils.book_new();
+  departments.forEach(dept => {
+    const subjectsMap = deptToSubjects[dept];
+    const subjectCodes = Array.from(subjectsMap.keys());
+    const header = ['Reg No','Name', ...subjectCodes.map(c => subjectsMap.get(c))];
+
+    const rows = Array.from(regsAll)
+      .map(reg => regToStudent.get(reg))
+      .filter(Boolean)
+      .filter(s => {
+        const primaryOk = !s.dept || normalizeDeptName(s.dept) === dept;
+        const hasDeptSubject = (s.subjects || []).some(c => normalizeDeptName(inferDeptFromSubject(c)) === dept);
+        return primaryOk && hasDeptSubject;
+      })
+      .sort((a,b) => String(a.RegNo).localeCompare(String(b.RegNo)))
+      .map(s => [s.RegNo, s.Name, ...subjectCodes.map(_ => '')]);
+
+    if (rows.length === 0) return; // skip empty department
+    const aoa = [header, ...rows];
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws['!cols'] = [ {wch:12}, {wch:28}, ...subjectCodes.map(()=>({wch:16})) ];
+    const name = (dept || 'Dept').toString().substring(0,31) || 'Dept';
+    XLSX.utils.book_append_sheet(wb, ws, name);
+  });
+
+  XLSX.writeFile(wb, `Dept-Attendance-${selectedDate}.xlsx`);
+}
+
+async function parseHeaderFromFile(file){
+  try{
+    const ab = await readFileAsArrayBuffer(file);
+    const wb = XLSX.read(ab, { type: 'array' });
+    const name = wb.SheetNames[0];
+    const ws = wb.Sheets[name];
+    const getCell = (addr)=> (ws && ws[addr] && ws[addr].v) ? String(ws[addr].v).trim() : '';
+    state.headerText = {
+      name: getCell('A1'),
+      info: getCell('A2'),
+      location: getCell('A3'),
+    };
+    state.headerTextLoaded = true;
+  }catch(e){
+    console.error('Failed to parse Header.xlsx upload', e);
+  }
+}
+
+// State
+const state = {
+  students: [], // [{RegNo, Name, subjects: [code,...], departments: Set}]
+  exams: [],    // [{Date, SubjectCode, SubjectName, Dept}]
+  halls: [],    // [{HallName, Capacity}]
+  parsed: false,
+  allocations: [], // [{hallName, date, subjectName(s), subjectCode(s), seats: 2D array, departmentsInHall:Set, startReg, endReg}]
+  // template removed
+  headerText: { name: '', info: '', location: '' },
+  headerTextLoaded: false,
+};
+
+// (Template override helpers removed) – we rely solely on Template.xlsx markers when provided
+
+// Elements
+const el = {
+  studentsFile: document.getElementById('studentsFile'),
+  examsFile: document.getElementById('examsFile'),
+  hallsFile: document.getElementById('hallsFile'),
+  parseBtn: document.getElementById('parseBtn'),
+  parseStatus: document.getElementById('parseStatus'),
+  dateSelect: document.getElementById('dateSelect'),
+  subjectSelect: document.getElementById('subjectSelect'),
+  allocateBtn: document.getElementById('allocateBtn'),
+  preview: document.getElementById('preview'),
+  downloadHallPdfsBtn: document.getElementById('downloadHallPdfsBtn'),
+  downloadSummaryPdfBtn: document.getElementById('downloadSummaryPdfBtn'),
+  examTitle: document.getElementById('examTitle'),
+  headerFile: document.getElementById('headerFile'),
+  // college header inputs removed; loaded from Header.xlsx
+};
+
+// Utilities
+function readFileAsArrayBuffer(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = e => resolve(e.target.result);
+    reader.onerror = reject;
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+function toDateString(x) {
+  if (!x) return '';
+  if (x instanceof Date) return x.toISOString().slice(0, 10);
+  // If Excel date stored as string like '2025-10-11' or '11/10/2025'
+  const d = new Date(x);
+  if (!isNaN(d)) return d.toISOString().slice(0, 10);
+  return String(x);
+}
+
+function inferDeptFromSubject(subjectCode) {
+  if (!subjectCode) return '';
+  const code = String(subjectCode).trim().toUpperCase();
+  // Extract consecutive letters segment
+  const letters = (code.match(/[A-Z]+/g) || [''])[0];
+  const two = letters.slice(0, 2);
+  if (two === 'CS') return 'CSE';
+  if (two === 'CD') return 'CSD';
+  return letters || two || code;
+}
+
+function normalizeDeptName(v) {
+  if (!v) return '';
+  const s = String(v).trim().toUpperCase();
+  if (s === 'CS' || s === 'CSE') return 'CSE';
+  if (s === 'CD' || s === 'CSD') return 'CSD';
+  return s;
+}
+
+function unique(arr) { return Array.from(new Set(arr)); }
+
+function groupBy(arr, keyFn) {
+  return arr.reduce((acc, item) => {
+    const k = keyFn(item);
+    (acc[k] ||= []).push(item);
+    return acc;
+  }, {});
+}
+
+// SheetJS helpers
+async function parseWorkbook(file) {
+  const ab = await readFileAsArrayBuffer(file);
+  const wb = XLSX.read(ab, { type: 'array' });
+  return wb;
+}
+
+function sheetToJsonFirstSheet(wb) {
+  const name = wb.SheetNames[0];
+  const ws = wb.Sheets[name];
+  return XLSX.utils.sheet_to_json(ws, { defval: '' });
+}
+
+// Parsing
+async function parseFiles() {
+  el.parseStatus.textContent = '';
+  if (!el.studentsFile.files[0] || !el.examsFile.files[0] || !el.hallsFile.files[0]) {
+    el.parseStatus.textContent = 'Please choose all three Excel files.';
+    return;
+  }
+  try {
+    const promises = [
+      parseWorkbook(el.studentsFile.files[0]),
+      parseWorkbook(el.examsFile.files[0]),
+      parseWorkbook(el.hallsFile.files[0]),
+    ];
+    const results = await Promise.all(promises);
+    const [wbStudents, wbExams, wbHalls] = results;
+
+    const studentsRows = sheetToJsonFirstSheet(wbStudents);
+    const examsRows = sheetToJsonFirstSheet(wbExams);
+    const hallsRows = sheetToJsonFirstSheet(wbHalls);
+
+    // Normalize Halls
+    state.halls = hallsRows
+      .map(r => ({
+        HallName: String(r.HallName || r.hall || r.Hall || '').trim(),
+        Capacity: Number(r.Capacity || r.capacity || 0) || 0,
+        BlockName: String(r.Block || r['Block Name'] || r.BlockName || '').trim(),
+      }))
+      .filter(h => h.HallName && h.Capacity > 0);
+
+    // Normalize Exams
+    state.exams = examsRows
+      .map(r => {
+        const SubjectCode = String(r.SubjectCode || r.code || '').trim();
+        // Prefer explicit department column if present
+        const deptRaw = r.Dept ?? r.Department ?? r.department ?? r.DEPT ?? r.BRANCH;
+        const Dept = deptRaw ? normalizeDeptName(deptRaw) : normalizeDeptName(inferDeptFromSubject(SubjectCode));
+        const Session = String(r.Session || r.session || r.SESSION || '').trim().toUpperCase(); // FN/AN
+        return {
+          Date: toDateString(r.Date || r.date),
+          SubjectCode,
+          SubjectName: String(r.SubjectName || r.name || '').trim(),
+          Dept,
+          Session,
+        };
+      })
+      .filter(e => e.Date && e.SubjectCode);
+
+    // Normalize Students
+    // Collect all SubjectCode-like columns (anything that includes 'Subject' or 'Code')
+    const subjectCols = unique(
+      Object.keys(studentsRows[0] || {})
+        .filter(k => /subject|code/i.test(k) && !/^reg/i.test(k) && !/^name/i.test(k))
+    );
+
+    state.students = studentsRows
+      .map(r => {
+        const RegNo = String(r.RegNo || r.Reg || r.RegisterNo || r['Register No'] || '').trim();
+        const Name = String(r.Name || r.Student || r['Student Name'] || '').trim();
+        const subjects = subjectCols
+          .map(c => String(r[c]).trim())
+          .filter(v => v && v !== '');
+        const departments = new Set(subjects.map(inferDeptFromSubject));
+        // Prefer explicit primary dept if provided in Students sheet
+        const deptRaw = r.Dept ?? r.Department ?? r.department ?? r.DEPT ?? r.Branch ?? r.BRANCH;
+        const dept = deptRaw ? normalizeDeptName(deptRaw) : '';
+        if (dept) departments.add(dept);
+        return { RegNo, Name, subjects, departments, dept };
+      })
+      .filter(s => s.RegNo && s.Name);
+
+    if (state.exams.length === 0) throw new Error('Exams sheet is empty or invalid');
+    if (state.students.length === 0) throw new Error('Students sheet is empty or invalid');
+    if (state.halls.length === 0) throw new Error('Halls sheet is empty or invalid');
+
+    // Template removed
+
+    // Populate Dates
+    const dates = unique(state.exams.map(e => e.Date)).sort();
+    el.dateSelect.innerHTML = '<option value="">Select date</option>' +
+      dates.map(d => `<option value="${d}">${d}</option>`).join('');
+
+    el.parseStatus.textContent = 'Parsed successfully. Choose date and options.';
+    state.parsed = true;
+    el.allocateBtn.disabled = true;
+    updateExamTypeInteraction();
+  } catch (err) {
+    console.error(err);
+    el.parseStatus.textContent = 'Parse failed: ' + err.message;
+  }
+}
+
+// template parsing removed
+
+function updateExamTypeInteraction() {
+  const type = getExamType();
+  const date = el.dateSelect.value;
+  if (!state.parsed) return;
+
+  if (type === 'internal') {
+    el.subjectSelect.disabled = false;
+    // Subjects only for selected date
+    const subs = state.exams.filter(e => !date || e.Date === date);
+    const options = subs.map(e => ({
+      value: e.SubjectCode,
+      label: `${e.SubjectName || e.SubjectCode} (${e.SubjectCode})`
+    }));
+    el.subjectSelect.innerHTML = '<option value="">Select subject</option>' +
+      options.map(o => `<option value="${o.value}">${o.label}</option>`).join('');
+  } else {
+    // semester
+    el.subjectSelect.disabled = true;
+    el.subjectSelect.innerHTML = '<option value="">All subjects on selected date</option>';
+  }
+  el.allocateBtn.disabled = !date;
+}
+
+function getExamType() {
+  const el = document.querySelector('input[name="examType"]:checked');
+  return el ? el.value : 'semester';
+}
+
+// Allocation helpers
+function computeGrid(capacity) {
+  // Fixed 5 columns; rows grow with capacity
+  const cols = 5;
+  const rows = Math.ceil(capacity / cols) || 1;
+  return { rows, cols };
+}
+
+function placeColumnWise(studentsList, capacity) {
+  const { rows, cols } = computeGrid(capacity);
+  const grid = Array.from({ length: rows }, () => Array(cols).fill(''));
+  let i = 0; // index in studentsList
+  for (let c = 0; c < cols; c++) {
+    for (let r = 0; r < rows; r++) {
+      const idx = c * rows + r; // column-major seat index
+      if (idx >= capacity) break;
+      grid[r][c] = studentsList[i] || '';
+      i++;
+    }
+  }
+  return grid;
+}
+
+function flattenGrid(grid) {
+  const rows = grid.length;
+  const cols = grid[0]?.length || 0;
+  const out = [];
+  for (let c = 0; c < cols; c++) {
+    for (let r = 0; r < rows; r++) out.push(grid[r][c]);
+  }
+  return out.filter(Boolean);
+}
+
+// Internal allocation
+function allocateInternal(date, subjectCode) {
+  // Students who have this subject
+  const studentsForSubject = state.students.filter(s => s.subjects.includes(subjectCode));
+  // Split department-wise (based on this subject's dept)
+  const dept = inferDeptFromSubject(subjectCode);
+  const byDept = groupBy(studentsForSubject, _ => dept); // single dept bucket
+
+  const sortedHalls = [...state.halls];
+  const allocations = [];
+
+  const deptKeys = Object.keys(byDept);
+  let hallIdx = 0;
+  // Session from Exams.xlsx for this date+subject
+  const examRow = state.exams.find(e => e.Date === date && e.SubjectCode === subjectCode);
+  const sessionForDate = examRow?.Session || '';
+  for (const d of deptKeys) {
+    const queue = [...byDept[d]].sort((a,b) => a.RegNo.localeCompare(b.RegNo));
+    while (queue.length > 0 && hallIdx < sortedHalls.length) {
+      const hall = sortedHalls[hallIdx];
+      const take = queue.splice(0, hall.Capacity);
+      const seats = placeColumnWise(take.map(s => `${s.RegNo}`), hall.Capacity);
+      const ranges = [];
+      if (take.length) {
+        const regs = take.map(s => s.RegNo);
+        ranges.push({ dept: d, start: regs[0], end: regs[regs.length - 1] });
+      }
+      const perDeptCounts = {}; perDeptCounts[d] = take.length;
+      const perSubjectCounts = {}; perSubjectCounts[subjectCode] = take.length;
+      allocations.push({
+        hallName: hall.HallName,
+        date,
+        session: sessionForDate,
+        blockName: hall.BlockName || '',
+        subjectNames: [getSubjectName(subjectCode)],
+        subjectCodes: [subjectCode],
+        seats,
+        departmentsInHall: new Set([d]),
+        perDeptRanges: ranges,
+        perDeptCounts,
+        perSubjectCounts,
+      });
+      hallIdx++;
+    }
+  }
+
+  return allocations;
+}
+
+function getSubjectName(code) {
+  const e = state.exams.find(x => x.SubjectCode === code);
+  return e?.SubjectName || code;
+}
+
+// Semester allocation
+function allocateSemester(date) {
+  // At a selected date, there could be multiple subjects from different departments
+  const examsOnDate = state.exams.filter(e => e.Date === date);
+  const subjectsByDept = groupBy(examsOnDate, e => e.Dept);
+
+  // For each dept, collect students who have any of this dept's subjects on that date
+  const deptToStudents = {};
+  for (const [dept, exams] of Object.entries(subjectsByDept)) {
+    const codes = new Set(exams.map(e => e.SubjectCode));
+    const studs = state.students.filter(s => {
+      const hasSubject = s.subjects.some(code => codes.has(code));
+      // If student's primary dept is known, ensure it matches this dept
+      const deptMatch = !s.dept || s.dept === normalizeDeptName(dept);
+      return hasSubject && deptMatch;
+    });
+    deptToStudents[dept] = studs.sort((a,b) => a.RegNo.localeCompare(b.RegNo));
+  }
+
+  // Pair departments arbitrarily in sorted order
+  const depts = Object.keys(deptToStudents).sort();
+  const pairs = [];
+  for (let i = 0; i < depts.length; i += 2) {
+    const a = depts[i];
+    const b = depts[i+1] || null;
+    pairs.push([a, b]);
+  }
+
+  const halls = [...state.halls];
+  const allocations = [];
+  let hallIndex = 0;
+
+  // Choose Session for this date (first non-empty from examsOnDate). BlockName comes from Halls.xlsx per hall
+  const sessionForDate = (examsOnDate.find(e => e.Session)?.Session) || '';
+
+  for (const [deptA, deptB] of pairs) {
+    let A = [...(deptToStudents[deptA] || [])];
+    let B = deptB ? [...(deptToStudents[deptB] || [])] : [];
+
+    let swap = false; // alternate 12/13 split across halls
+    while ((A.length > 0 || B.length > 0) && hallIndex < halls.length) {
+      const hall = halls[hallIndex];
+      const cap = hall.Capacity;
+      // Split roughly half: apply 12/13 style using floor/ceil
+      let aQuota = Math.floor(cap / 2);
+      let bQuota = cap - aQuota; // ceil
+      if (swap) [aQuota, bQuota] = [bQuota, aQuota];
+
+      const takeA = A.splice(0, aQuota);
+      const takeB = B.splice(0, bQuota);
+
+      // Alternate students A, B, A, B ... with dept tagging
+      const ordered = [];
+      let i = 0;
+      while (ordered.length < cap && (i < takeA.length || i < takeB.length)) {
+        if (i < takeA.length) ordered.push({ ...takeA[i], __dept: deptA });
+        if (ordered.length >= cap) break;
+        if (i < takeB.length) ordered.push({ ...takeB[i], __dept: deptB });
+        i++;
+      }
+      // If seats remain and one dept still has more, pull more from that dept first
+      while (ordered.length < cap && (A.length > 0 || B.length > 0)) {
+        if (A.length > 0) ordered.push({ ...(A.shift()), __dept: deptA });
+        else if (B.length > 0) ordered.push({ ...(B.shift()), __dept: deptB });
+      }
+
+      // If still seats remain, fill from other depts not in this hall
+      if (ordered.length < cap) {
+        const others = depts.filter(d => d !== deptA && d !== deptB);
+        for (const od of others) {
+          const pool = deptToStudents[od] || [];
+          while (ordered.length < cap && pool.length > 0) {
+            ordered.push({ ...(pool.shift()), __dept: od });
+          }
+          if (ordered.length >= cap) break;
+        }
+      }
+
+      const labels = ordered.map(s => s ? `${s.RegNo}` : '');
+      const seats = placeColumnWise(labels, cap);
+      // Build per-dept ranges (without names)
+      const perDeptRanges = [];
+      const byDept = groupBy(ordered.filter(Boolean), x => x.__dept || '');
+      const perDeptCounts = {};
+      // Build per-subject counts using subject codes for the date in each dept
+      const perSubjectCounts = {};
+      const codeToName = {};
+      for (const e of examsOnDate) codeToName[e.SubjectCode] = e.SubjectName || e.SubjectCode;
+      for (const [dept, arr] of Object.entries(byDept)) {
+        if (!dept) continue;
+        // codes offered by this dept on date
+        const codes = new Set((subjectsByDept[dept] || []).map(e => e.SubjectCode));
+        // assign each student to one matching subject code
+        arr.forEach(stu => {
+          const matched = (stu.subjects || []).find(c => codes.has(c));
+          const key = matched || `UNKNOWN_${dept}`;
+          perSubjectCounts[key] = (perSubjectCounts[key] || 0) + 1;
+        });
+      }
+      for (const [dept, arr] of Object.entries(byDept)) {
+        if (!dept) continue;
+        const regs = arr.map(x => x.RegNo);
+        if (regs.length) perDeptRanges.push({ dept, start: regs[0], end: regs[regs.length - 1] });
+        perDeptCounts[dept] = arr.length;
+      }
+      const subsInHall = new Set();
+      const subjectNames = new Set();
+      const subjectCodes = new Set();
+
+      // Determine which subjects appear for these depts on this date for summary header
+      for (const e of examsOnDate) {
+        if (e.Dept === deptA || e.Dept === deptB) {
+          subsInHall.add(e.Dept);
+          subjectNames.add(e.SubjectName || e.SubjectCode);
+          subjectCodes.add(e.SubjectCode);
+        }
+      }
+
+      allocations.push({
+        hallName: hall.HallName,
+        date,
+        session: sessionForDate,
+        blockName: hall.BlockName || '',
+        subjectNames: Array.from(subjectNames),
+        subjectCodes: Array.from(subjectCodes),
+        seats,
+        departmentsInHall: new Set([deptA, ...(deptB ? [deptB] : [])]),
+        perDeptRanges,
+        perDeptCounts,
+        perSubjectCounts,
+      });
+
+      hallIndex++;
+      swap = !swap;
+    }
+  }
+
+  return allocations;
+}
+
+// Rendering
+function clearPreview() { el.preview.innerHTML = ''; }
+
+function renderAllocations(allocations) {
+  clearPreview();
+  state.allocations = allocations;
+
+  allocations.forEach((a, idx) => {
+    const { rows, cols } = computeGrid(a.seats.length * (a.seats[0]?.length || 0));
+
+    const card = document.createElement('div');
+    card.className = 'hall-card';
+    card.id = `hall-card-${idx}`;
+
+    const header = document.createElement('div');
+    header.className = 'hall-header';
+    header.innerHTML = `
+      <div><strong>${a.hallName}</strong></div>
+      <div class="muted">${a.date}</div>
+    `;
+
+    const meta = document.createElement('div');
+    meta.className = 'muted small';
+    meta.textContent = `${a.subjectNames.join(' / ')}  |  ${a.subjectCodes.join(', ')}`;
+
+    const tableWrap = document.createElement('div');
+    tableWrap.className = 'table-wrap';
+
+    const table = document.createElement('table');
+    table.className = 'table';
+
+    // No column headers; body shows separate columns: [SeatNo, RegNo] per seat
+    const tbody = document.createElement('tbody');
+    // Compute how many seats are actually filled
+    const flatFilled = flattenGrid(a.seats).filter(Boolean);
+    const filledCount = flatFilled.length;
+    for (let r = 0; r < rows; r++) {
+      const tr = document.createElement('tr');
+      for (let c = 0; c < cols; c++) {
+        const idx = c * rows + r; // column-major index
+        const show = idx < filledCount;
+        const reg = a.seats[r]?.[c] || '';
+
+        const tdSeat = document.createElement('td');
+        tdSeat.textContent = show ? String(idx + 1) : '';
+        tr.appendChild(tdSeat);
+
+        const tdReg = document.createElement('td');
+        tdReg.textContent = show ? reg : '';
+        tr.appendChild(tdReg);
+      }
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+
+    tableWrap.appendChild(table);
+
+    const foot = document.createElement('div');
+    foot.className = 'footer-note';
+    const flat = flattenGrid(a.seats);
+    const nonEmpty = flat.filter(Boolean);
+    // Build per-department ranges text (without dept labels)
+    const rangesText = (a.perDeptRanges && a.perDeptRanges.length)
+      ? a.perDeptRanges.map(r => `${r.start} - ${r.end}`).join('; ')
+      : (nonEmpty.length ? `${nonEmpty[0]} - ${nonEmpty[nonEmpty.length - 1]}` : '');
+    foot.textContent = `Seats: ${nonEmpty.length}  |  Rows: ${rows}  Cols: ${cols}  |  RegNo Ranges: ${rangesText}`;
+
+    card.appendChild(header);
+    card.appendChild(meta);
+    card.appendChild(tableWrap);
+    card.appendChild(foot);
+
+    el.preview.appendChild(card);
+  });
+
+  el.downloadHallPdfsBtn.disabled = allocations.length === 0;
+  el.downloadSummaryPdfBtn.disabled = allocations.length === 0;
+  const excelBtn = document.getElementById('downloadExcelBtn');
+  if (excelBtn) excelBtn.disabled = allocations.length === 0;
+  const deptAttBtn = document.getElementById('downloadDeptAttendancePdfBtn');
+  if (deptAttBtn) deptAttBtn.disabled = allocations.length === 0;
+}
+
+// PDF Export via jsPDF + autoTable (reliable)
+async function downloadHallPdfs() {
+  const { jsPDF } = window.jspdf || {};
+  if (!jsPDF || !window.jspdf || !window.jspdf.jsPDF) {
+    alert('jsPDF not loaded');
+    return;
+  }
+  if (!state.allocations.length) {
+    alert('No allocations available. Allocate first.');
+    return;
+  }
+  // Single combined document with one page per hall
+  const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+  for (let i = 0; i < state.allocations.length; i++) {
+    const a = state.allocations[i];
+
+    const examType = getExamType();
+    const isUnified = (examType === 'semester' || examType === 'internal');
+    const examTitle = (el.examTitle?.value || '').trim();
+
+    // Institute header (three-line text from Header.xlsx)
+    if (!state.headerTextLoaded) await loadHeaderTextOnce();
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
+    const cursorY = 10;
+    const centerX = pageWidth/2;
+    const name = (state.headerText?.name || '').trim();
+    const info = (state.headerText?.info || '').trim();
+    const location = (state.headerText?.location || '').trim();
+    const imageLeft = (state.headerText?.imageLeft || '').trim();
+    const imageRight = (state.headerText?.imageRight || '').trim();
+    let nameY = cursorY + 4;
+    if (name) { doc.setFontSize(18); doc.setFont(undefined, 'bold'); doc.text(name, centerX, nameY, { align: 'center' }); }
+    if (info) { doc.setFontSize(11); doc.setFont(undefined, 'normal'); doc.text(info, centerX, nameY + 7, { align: 'center' }); }
+    if (location) { doc.setFontSize(13); doc.setFont(undefined, 'bold'); doc.text(location, centerX, nameY + 14, { align: 'center' }); }
+    // Try to draw header images if filenames provided (relative to app root)
+    const logoW = 26, logoH = 26;
+    const gapFromCenter = 76; // distance from center to inner edges of logos
+    const leftX = centerX - gapFromCenter - logoW;
+    const rightX = centerX + gapFromCenter;
+    // Align logos so their top edge starts at the second line of the college name (info line)
+    const secondLineY = nameY + 15;
+    const imgY = Math.max(0, secondLineY - logoH + 1);
+    // Helper to fetch and embed first available image from candidates; ignore failures
+    async function tryAddAny(candidates, x){
+      for (const path of candidates){
+        if (!path) continue;
+        try{
+          const res = await fetch(path, { cache: 'no-store' });
+          if (!res.ok) continue;
+          const blob = await res.blob();
+          const dataUrl = await new Promise(r=>{ const fr=new FileReader(); fr.onload=()=>r(fr.result); fr.readAsDataURL(blob); });
+          const fmt = /png/i.test(blob.type) ? 'PNG' : 'JPEG';
+          doc.addImage(dataUrl, fmt, x, imgY, logoW, logoH);
+          return true;
+        }catch(_){ /* try next */ }
+      }
+      return false;
+    }
+    const leftCandidates = imageLeft
+      ? [imageLeft, `./${imageLeft}`]
+      : ['1st.jpg','./1st.jpg','1st.png','./1st.png'];
+    const rightCandidates = imageRight
+      ? [imageRight, `./${imageRight}`]
+      : ['3rd.jpg','./3rd.jpg','3rd.png','./3rd.png'];
+    await Promise.all([
+      tryAddAny(leftCandidates, leftX),
+      tryAddAny(rightCandidates, rightX)
+    ]);
+
+    // After header block
+    let headerBottomY = Math.max(cursorY + 30, imgY + logoH + 6); // ensure spacing below logos/name
+
+    if (isUnified) {
+      // Header center
+      if (examTitle) {
+        doc.setFontSize(16); doc.setFont(undefined, 'bold');
+        const w = doc.getTextWidth(examTitle);
+        const x = (pageWidth - w) / 2;
+        doc.text(examTitle, x, headerBottomY);
+        doc.setFont(undefined, 'normal');
+      }
+      doc.setFontSize(12); doc.setFont(undefined, 'bold');
+      const so = 'SEATING ORDER';
+      const sow = doc.getTextWidth(so);
+      const sox = (pageWidth - sow) / 2;
+      doc.text(so, sox, headerBottomY + 8);
+      doc.setFont(undefined, 'normal');
+
+      // Single meta row: left and right aligned
+      doc.setFontSize(13);
+      const metaY = headerBottomY + 20;
+      const leftMargin = 14;
+      const rightMargin = 14;
+      const leftMeta = `Date & Session: ${a.date} & ${a.session || ''}`;
+      const rightMeta = `Hall & Block: ${a.hallName} & ${a.blockName || ''}`;
+      doc.text(leftMeta, leftMargin, metaY, { align: 'left' });
+      doc.text(rightMeta, pageWidth - rightMargin, metaY, { align: 'right' });
+    } else if (!state.template) {
+      // Default simple header if no template and not semester
+      doc.setFontSize(12);
+      doc.text(`Hall: ${a.hallName}`, pageWidth/2, headerBottomY, { align: 'center' });
+      doc.setFontSize(12);
+      doc.text(`Date: ${a.date}`, pageWidth/2, headerBottomY + 8, { align: 'center' });
+      doc.text(`Subject: ${(a.subjectNames||[]).join(' / ')}`, pageWidth/2, headerBottomY + 14, { align: 'center' });
+      doc.text(`Code: ${(a.subjectCodes||[]).join(', ')}`, pageWidth/2, headerBottomY + 20, { align: 'center' });
+    }
+
+    // Start Y after header
+    let startY = isUnified ? (headerBottomY + 40) : (headerBottomY + 32); // more space before table
+
+    // Build seat-number table with separate columns [SeatNo, RegNo] per seat (no headers)
+    const rows = a.seats.length;
+    const cols = a.seats[0]?.length || 5;
+    const filledCount = a.seats.flat().filter(Boolean).length;
+    const body = [];
+    for (let r = 0; r < rows; r++) {
+      const row = [];
+      for (let c = 0; c < cols; c++) {
+        const idx = c * rows + r; // column-major
+        const reg = a.seats[r]?.[c] || '';
+        row.push(idx < filledCount ? String(idx + 1) : '');
+        row.push(idx < filledCount ? reg : '');
+      }
+      body.push(row);
+    }
+
+    // Prepare header row for the table
+    const headerRow = [];
+    for (let c = 0; c < cols; c++) {
+      headerRow.push('Seat No', 'Register No');
+    }
+    
+    // Insert header row at the beginning of the body
+    body.unshift(headerRow);
+
+    // autoTable with headers and grid borders
+    const targetTableWidth = doc.internal.pageSize.getWidth() * 0.75; // 75% of page width
+    const centerLeft = (doc.internal.pageSize.getWidth() - targetTableWidth) / 2;
+    doc.autoTable({
+      startY,
+      head: [headerRow],
+      body: body.slice(1), // Exclude header from body since it's in head
+      theme: 'grid',
+      headStyles: { 
+        fillColor: [220, 220, 220], 
+        textColor: [0, 0, 0],
+        fontStyle: 'bold',
+        halign: 'center',
+        lineWidth: 0.6
+      },
+      styles: { 
+        fontSize: 11, 
+        cellPadding: 3, 
+        fontStyle: 'bold', 
+        halign: 'center', 
+        lineColor: [0,0,0], 
+        lineWidth: 0.6 
+      },
+      alternateRowStyles: { fillColor: [250, 250, 250] },
+      tableWidth: targetTableWidth,
+      margin: { left: centerLeft, right: centerLeft },
+    });
+
+    let y = doc.lastAutoTable.finalY + 12; // more space after table
+    doc.setFontSize(10);
+    if (isUnified) {
+      // Per-subject count lines (with department) and total, then signatures
+      // Build mapping subject code -> name and dept for this date
+      const codeToName = {};
+      const codeToDept = {};
+      state.exams.filter(e => e.Date === a.date).forEach(e => {
+        codeToName[e.SubjectCode] = e.SubjectName || e.SubjectCode;
+        codeToDept[e.SubjectCode] = e.Dept || '';
+      });
+      const entries = Object.entries(a.perSubjectCounts || {});
+      entries.sort((x,y) => x[0].localeCompare(y[0]));
+      let total = 0;
+      const leftMargin = 28;
+      entries.forEach(([code, count]) => {
+        const name = codeToName[code] || (code.startsWith('UNKNOWN_') ? (code.substring('UNKNOWN_'.length) + ' Dept') : '');
+        const dept = codeToDept[code] || '';
+        const line = dept ? `${code} / ${name} - ${dept} : ${count}` : `${code} / ${name} : ${count}`;
+        doc.text(line, leftMargin, y, { align: 'left' });
+        y += 6; total += count;
+      });
+      doc.setFont(undefined, 'bold');
+      doc.text(`Total : ${total}`, leftMargin, y, { align: 'left' });
+      doc.setFont(undefined, 'normal');
+      // Signatures
+      const bottomPadding = 12; // ensure space at bottom of page
+      const bottomY = Math.min(pageHeight - bottomPadding, y + 28);
+      const quarter = pageWidth * 0.25;
+      const threeQuarter = pageWidth * 0.75;
+      doc.text('Signature of the Hall Superintendent', quarter, bottomY, { align: 'center' });
+      doc.text('Signature of the Chief Superintendent', threeQuarter, bottomY, { align: 'center' });
+    } else {
+      // Default footer for non-unified mode
+      const rangesText = (a.perDeptRanges && a.perDeptRanges.length)
+        ? a.perDeptRanges.map(r => `${r.start} - ${r.end}`).join('; ')
+        : '';
+      doc.text(`RegNo Ranges: ${rangesText}`, pageWidth/2, y, { align: 'center' });
+    }
+
+    if (i < state.allocations.length - 1) {
+      doc.addPage('a4', 'landscape');
+    }
+  }
+  const date = state.allocations[0]?.date || 'Allocation';
+  doc.save(`Hall-Allocations-${date}.pdf`);
+}
+
+async function downloadSummaryPdf() {
+  const { jsPDF } = window.jspdf || {};
+  if (!jsPDF || !window.jspdf || !window.jspdf.jsPDF) {
+    alert('jsPDF not loaded');
+    return;
+  }
+  const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+  if (!state.headerTextLoaded) await loadHeaderTextOnce();
+  const pageWidthP = doc.internal.pageSize.getWidth();
+  const pageHeightP = doc.internal.pageSize.getHeight();
+  const cursorYP = 10;
+  const centerXP = pageWidthP / 2;
+  const nameP = (state.headerText?.name || '').trim();
+  const infoP = (state.headerText?.info || '').trim();
+  const locationP = (state.headerText?.location || '').trim();
+  const imageLeftP = (state.headerText?.imageLeft || '').trim();
+  const imageRightP = (state.headerText?.imageRight || '').trim();
+  let nameYP = cursorYP + 4;
+  if (nameP) { doc.setFontSize(16); doc.setFont(undefined, 'bold'); doc.text(nameP, centerXP, nameYP, { align: 'center' }); }
+  if (infoP) { doc.setFontSize(10); doc.setFont(undefined, 'normal'); doc.text(infoP, centerXP, nameYP + 7, { align: 'center' }); }
+  if (locationP) { doc.setFontSize(12); doc.setFont(undefined, 'bold'); doc.text(locationP, centerXP, nameYP + 14, { align: 'center' }); }
+  const logoWP = 22, logoHP = 22;
+  const gapFromCenterP = 65;
+  const leftXP = centerXP - gapFromCenterP - logoWP;
+  const rightXP = centerXP + gapFromCenterP;
+  const secondLineYP = nameYP + 15;
+  const imgYP = Math.max(0, secondLineYP - logoHP + 1);
+  async function tryAddAnyP(candidates, x){
+    for (const path of candidates){
+      if (!path) continue;
+      try{
+        const res = await fetch(path, { cache: 'no-store' });
+        if (!res.ok) continue;
+        const blob = await res.blob();
+        const dataUrl = await new Promise(r=>{ const fr=new FileReader(); fr.onload=()=>r(fr.result); fr.readAsDataURL(blob); });
+        const fmt = /png/i.test(blob.type) ? 'PNG' : 'JPEG';
+        doc.addImage(dataUrl, fmt, x, imgYP, logoWP, logoHP);
+        return true;
+      }catch(_){ }
+    }
+    return false;
+  }
+  const leftCandidatesP = imageLeftP ? [imageLeftP, `./${imageLeftP}`] : ['1st.jpg','./1st.jpg','1st.png','./1st.png'];
+  const rightCandidatesP = imageRightP ? [imageRightP, `./${imageRightP}`] : ['3rd.jpg','./3rd.jpg','3rd.png','./3rd.png'];
+  await Promise.all([
+    tryAddAnyP(leftCandidatesP, leftXP),
+    tryAddAnyP(rightCandidatesP, rightXP)
+  ]);
+  let headerBottomYP = Math.max(cursorYP + 30, imgYP + logoHP + 6);
+  doc.setFontSize(16);
+  const sumTitle = 'Hall Allocation Summary';
+  const sumW = doc.getTextWidth(sumTitle);
+  const sumX = (pageWidthP - sumW) / 2;
+  doc.text(sumTitle, sumX, headerBottomYP);
+
+  const head = [['Hall', 'Date', 'Subject Name', 'Subject Code', 'Department', 'RegNo Ranges', 'Total']];
+  const body = state.allocations.map(a => {
+    const rangesText = (a.perDeptRanges && a.perDeptRanges.length)
+      ? a.perDeptRanges.map(r => `${r.start} - ${r.end}`).join('; ')
+      : '';
+    // Build counts like "12 + 13 = 25" without department names
+    let countsText = '';
+    if (a.perDeptCounts && Object.keys(a.perDeptCounts).length) {
+      const counts = Object.values(a.perDeptCounts);
+      const sum = counts.reduce((p, c) => p + c, 0);
+      countsText = counts.join(' + ') + ' = ' + sum;
+    }
+    const deptText = Array.from(a.departmentsInHall || []).filter(Boolean).join(', ');
+    return [
+      a.hallName,
+      a.date,
+      (a.subjectNames||[]).join(' / '),
+      (a.subjectCodes||[]).join(', '),
+      deptText,
+      rangesText,
+      countsText,
+    ];
+  });
+
+  doc.autoTable({
+    startY: headerBottomYP + 12,
+    head,
+    body,
+    theme: 'grid',
+    styles: { fontSize: 9, lineColor: [0,0,0], lineWidth: 0.2, textColor: 0 },
+    headStyles: { fillColor: [255, 255, 255], textColor: 0 },
+    bodyStyles: { fillColor: [255, 255, 255], textColor: 0 },
+  });
+  doc.save('Allocation-Summary.pdf');
+}
+
+// Department-wise Attendance PDFs (one PDF per department, for selected date)
+async function downloadDeptAttendancePdfs() {
+  const { jsPDF } = window.jspdf || {};
+  if (!jsPDF || !window.jspdf || !window.jspdf.jsPDF) {
+    alert('jsPDF not loaded');
+    return;
+  }
+  if (!state.allocations.length) {
+    alert('No allocations available. Allocate first.');
+    return;
+  }
+  if (!state.headerTextLoaded) await loadHeaderTextOnce();
+
+  const selectedDate = el.dateSelect.value;
+  if (!selectedDate) { alert('Select a date first.'); return; }
+
+  // Single combined document: one page per department
+  const combinedDoc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+  let isFirstPage = true;
+  let generated = 0;
+
+  // Helper: draw header with logos and three lines; return bottom Y
+  async function drawHeader(doc){
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const cursorY = 10; const centerX = pageWidth/2;
+    const name = (state.headerText?.name || '').trim();
+    const info = (state.headerText?.info || '').trim();
+    const location = (state.headerText?.location || '').trim();
+    const imageLeft = (state.headerText?.imageLeft || '').trim();
+    const imageRight = (state.headerText?.imageRight || '').trim();
+    let nameY = cursorY + 4;
+    if (name) { doc.setFontSize(16); doc.setFont(undefined, 'bold'); doc.text(name, centerX, nameY, { align: 'center' }); }
+    if (info) { doc.setFontSize(10); doc.setFont(undefined, 'normal'); doc.text(info, centerX, nameY + 7, { align: 'center' }); }
+    if (location) { doc.setFontSize(12); doc.setFont(undefined, 'bold'); doc.text(location, centerX, nameY + 14, { align: 'center' }); }
+    const logoW = 22, logoH = 22; const gap = 65;
+    const leftX = centerX - gap - logoW; const rightX = centerX + gap;
+    const secondLineY = nameY + 15; const imgY = Math.max(0, secondLineY - logoH + 1);
+    async function tryAddAny(candidates, x){
+      for (const path of candidates){
+        if (!path) continue;
+        try {
+          const res = await fetch(path, { cache: 'no-store' });
+          if (!res.ok) continue;
+          const blob = await res.blob();
+          const dataUrl = await new Promise(r=>{ const fr=new FileReader(); fr.onload=()=>r(fr.result); fr.readAsDataURL(blob); });
+          const fmt = /png/i.test(blob.type) ? 'PNG' : 'JPEG';
+          doc.addImage(dataUrl, fmt, x, imgY, logoW, logoH);
+          break;
+        } catch(_) {}
+      }
+    }
+    const leftC = imageLeft ? [imageLeft, `./${imageLeft}`] : ['1st.jpg','./1st.jpg','1st.png','./1st.png'];
+    const rightC = imageRight ? [imageRight, `./${imageRight}`] : ['3rd.jpg','./3rd.jpg','3rd.png','./3rd.png'];
+    await Promise.all([tryAddAny(leftC, leftX), tryAddAny(rightC, rightX)]);
+    return Math.max(cursorY + 30, imgY + logoH + 6);
+  }
+
+  // Build department -> subjects on selected date
+  const examsOnDate = state.exams.filter(e => e.Date === selectedDate);
+  const deptToSubjects = examsOnDate.reduce((acc, e) => {
+    const d = normalizeDeptName(e.Dept || inferDeptFromSubject(e.SubjectCode));
+    if (!d) return acc;
+    (acc[d] ||= new Map()).set(e.SubjectCode, e.SubjectName || e.SubjectCode);
+    return acc;
+  }, {});
+
+  // Quick registry and allocations regs
+  const regToStudent = new Map(state.students.map(s => [s.RegNo, s]));
+  const regsAll = new Set();
+  state.allocations.forEach(a => flattenGrid(a.seats).forEach(r => { if (r) regsAll.add(r); }));
+
+  // For each department produce one PDF
+  const departments = Object.keys(deptToSubjects).sort();
+  if (departments.length === 0) { alert('No departments found for selected date.'); return; }
+
+  for (const dept of departments) {
+    const subjectsMap = deptToSubjects[dept];
+    const subjectCodes = Array.from(subjectsMap.keys());
+
+    // Students present for this dept: in allocations and belonging to dept (by primary dept or inferred via subjects)
+    const studentsInDept = Array.from(regsAll)
+      .map(reg => regToStudent.get(reg))
+      .filter(Boolean)
+      .filter(s => {
+        const primaryOk = !s.dept || normalizeDeptName(s.dept) === dept;
+        const hasDeptSubject = (s.subjects || []).some(c => normalizeDeptName(inferDeptFromSubject(c)) === dept);
+        return primaryOk && hasDeptSubject;
+      })
+      .sort((a,b) => String(a.RegNo).localeCompare(String(b.RegNo)));
+
+    if (studentsInDept.length === 0) continue;
+
+    if (!isFirstPage) combinedDoc.addPage('a4', 'portrait');
+    isFirstPage = false;
+    const doc = combinedDoc;
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const headerBottomY = await drawHeader(doc);
+
+    // Title and meta
+    doc.setFontSize(14); doc.setFont(undefined, 'bold');
+    const title = 'Department Attendance';
+    const tw = doc.getTextWidth(title);
+    doc.text(title, (pageWidth - tw)/2, headerBottomY);
+    doc.setFontSize(11); doc.setFont(undefined, 'normal');
+    const metaY = headerBottomY + 10;
+    const line1 = `Date : ${selectedDate}              Department : ${dept}`;
+    doc.text(line1, pageWidth/2, metaY, { align: 'center' });
+
+    // Table: Reg No, Name, then subject columns
+    const head = [[ 'Reg No', 'Name', ...subjectCodes.map(code => subjectsMap.get(code)) ]];
+    const body = studentsInDept.map(s => [ s.RegNo, s.Name, ...subjectCodes.map(_ => '') ]);
+    const leftRightMargin = 14;
+    doc.autoTable({
+      startY: metaY + 12,
+      head,
+      body,
+      theme: 'grid',
+      styles: { fontSize: 9, halign: 'center', lineColor: [0,0,0], lineWidth: 0.2 },
+      headStyles: { fillColor: [255,255,255], textColor: 0, fontStyle: 'bold' },
+      bodyStyles: { fillColor: [255,255,255], textColor: 0 },
+      margin: { left: leftRightMargin, right: leftRightMargin },
+    });
+
+    generated++;
+  }
+
+  if (generated === 0) {
+    alert('No department attendance pages were generated. Check the selected date and data.');
+    return;
+  }
+  combinedDoc.save(`Dept-Attendance-${selectedDate}.pdf`);
+}
+
+
+// Excel export: workbook with per-hall sheets + Summary
+function downloadExcelWorkbook() {
+  if (!state.allocations.length) return;
+  const wb = XLSX.utils.book_new();
+
+  // Summary sheet
+  const summaryAOA = [[
+    'Hall', 'Date', 'Subject Name', 'Subject Code', 'RegNo Ranges'
+  ]];
+  state.allocations.forEach(a => {
+    const rangesText = (a.perDeptRanges && a.perDeptRanges.length)
+      ? a.perDeptRanges.map(r => `${r.start} - ${r.end}`).join('; ')
+      : '';
+    summaryAOA.push([
+      a.hallName,
+      a.date,
+      (a.subjectNames||[]).join(' / '),
+      (a.subjectCodes||[]).join(', '),
+      rangesText,
+    ]);
+  });
+  const wsSummary = XLSX.utils.aoa_to_sheet(summaryAOA);
+  XLSX.utils.book_append_sheet(wb, wsSummary, 'Summary');
+
+  // Per hall sheets
+  state.allocations.forEach((a, idx) => {
+    let ws;
+    {
+      const aoa = [];
+      aoa.push([`Hall: ${a.hallName}`]);
+      aoa.push([`Date: ${a.date}`]);
+      aoa.push([`Subject: ${(a.subjectNames||[]).join(' / ')}`]);
+      aoa.push([`Code: ${(a.subjectCodes||[]).join(', ')}`]);
+      const rangesText = (a.perDeptRanges && a.perDeptRanges.length)
+        ? a.perDeptRanges.map(r => `${r.start} - ${r.end}`).join('; ')
+        : '';
+      aoa.push([`RegNo Ranges: ${rangesText}`]);
+      aoa.push([]);
+      const rows = a.seats.length;
+      const cols = a.seats[0]?.length || 5;
+      const filledCount = a.seats.flat().filter(Boolean).length;
+      for (let r = 0; r < rows; r++) {
+        const row = [];
+        for (let c = 0; c < cols; c++) {
+          const idx = c * rows + r; // column-major
+          const reg = a.seats[r]?.[c] || '';
+          row.push(idx < filledCount ? String(idx + 1) : '');
+          row.push(idx < filledCount ? reg : '');
+        }
+        aoa.push(row);
+      }
+      ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws['!cols'] = Array.from({ length: cols * 2 }, (_, i) => ({ wch: (i % 2 === 0) ? 8 : 18 }));
+    }
+    let name = (a.hallName || `Hall${idx+1}`).toString().substring(0, 28);
+    if (!name) name = `Hall${idx+1}`;
+    XLSX.utils.book_append_sheet(wb, ws, name);
+  });
+
+  const date = state.allocations[0]?.date || 'Allocation';
+  XLSX.writeFile(wb, `Hall-Allocation-${date}.xlsx`);
+}
+
+// Orchestration
+function onAllocate() {
+  const type = getExamType();
+  const date = el.dateSelect.value;
+  if (!date) return;
+
+  let allocations = [];
+  if (type === 'internal') {
+    const subjectCode = el.subjectSelect.value;
+    if (!subjectCode) {
+      alert('Select a subject for Internal exam.');
+      return;
+    }
+    allocations = allocateInternal(date, subjectCode);
+  } else {
+    allocations = allocateSemester(date);
+  }
+
+  if (allocations.length === 0) {
+    alert('No allocations could be generated. Check data.');
+  }
+  renderAllocations(allocations);
+  // Auto-generate attendance Excel and combined PDF after allocation
+  try {
+    downloadDeptAttendanceExcel();
+    downloadDeptAttendancePdfs();
+  } catch (e) {
+    console.error('Auto attendance export failed', e);
+  }
+}
+
+// Events
+el.parseBtn.addEventListener('click', parseFiles);
+['change', 'input'].forEach(evt => {
+  el.dateSelect.addEventListener(evt, updateExamTypeInteraction);
+});
+Array.from(document.querySelectorAll('input[name="examType"]')).forEach(r => {
+  r.addEventListener('change', updateExamTypeInteraction);
+});
+el.allocateBtn.addEventListener('click', onAllocate);
+el.downloadHallPdfsBtn.addEventListener('click', downloadHallPdfs);
+el.downloadSummaryPdfBtn.addEventListener('click', downloadSummaryPdf);
+const excelBtn = document.getElementById('downloadExcelBtn');
+if (excelBtn) excelBtn.addEventListener('click', downloadExcelWorkbook);
+const deptAttBtn = document.getElementById('downloadDeptAttendancePdfBtn');
+if (deptAttBtn) deptAttBtn.addEventListener('click', downloadDeptAttendancePdfs);
+ 
+// Header.xlsx upload handler
+if (el.headerFile) {
+  el.headerFile.addEventListener('change', async () => {
+    const file = el.headerFile.files && el.headerFile.files[0];
+    if (!file) return;
+    await parseHeaderFromFile(file);
+  });
+}
+
+// Replace placeholders in template strings
+function applyPlaceholders(text, a) {
+  if (typeof text !== 'string') return text;
+  const map = {
+    '{{HALL_NAME}}': a.hallName || '',
+    '{{DATE}}': a.date || '',
+    '{{SUBJECTS}}': (a.subjectNames||[]).join(' / '),
+    '{{CODES}}': (a.subjectCodes||[]).join(', '),
+    '{{RANGES}}': (a.perDeptRanges && a.perDeptRanges.length)
+      ? a.perDeptRanges.map(r => `${r.start} - ${r.end}`).join('; ')
+      : ''
+  };
+  let out = text;
+  Object.keys(map).forEach(k => { out = out.split(k).join(map[k]); });
+  return out
+    .replace(/HEADER_TEXT:.*/,'')
+    .replace(/FOOTER_TEXT:.*/,'')
+    .replace(/TABLE_START/,'');
+}
