@@ -829,27 +829,31 @@ async function downloadSummaryPdf() {
   const sumX = (pageWidthP - sumW) / 2;
   doc.text(sumTitle, sumX, headerBottomYP);
 
-  const head = [['Hall', 'Date', 'Subject Name', 'Subject Code', 'Department', 'RegNo Ranges', 'Total']];
+  const head = [['Hall', 'Date', 'Subject Name', 'Subject Code', 'Department', 'RegNo Ranges', 'Strength']];
   const body = state.allocations.map(a => {
     const rangesText = (a.perDeptRanges && a.perDeptRanges.length)
       ? a.perDeptRanges.map(r => `${r.start} - ${r.end}`).join('\n')
       : '';
-    // Build counts like "12 + 13 = 25" without department names
-    let countsText = '';
+    // Build per-department strength lines and total
+    let strengthText = '';
     if (a.perDeptCounts && Object.keys(a.perDeptCounts).length) {
-      const counts = Object.values(a.perDeptCounts);
-      const sum = counts.reduce((p, c) => p + c, 0);
-      countsText = counts.join(' + ') + ' = ' + sum;
+      const entries = Object.entries(a.perDeptCounts).sort((x,y)=>x[0].localeCompare(y[0]));
+      const lines = entries.map(([dept, cnt]) => `${dept} : ${cnt}`);
+      const total = entries.reduce((p, [,c]) => p + c, 0);
+      lines.push(`Total : ${total}`);
+      strengthText = lines.join('\n');
     }
-    const deptText = Array.from(a.departmentsInHall || []).filter(Boolean).join(', ');
+    const deptText = Array.from(a.departmentsInHall || []).filter(Boolean).join('\n');
+    const subjNamesText = (a.subjectNames||[]).join('\n');
+    const subjCodesText = (a.subjectCodes||[]).join('\n');
     return [
       a.hallName,
       a.date,
-      (a.subjectNames||[]).join(' / '),
-      (a.subjectCodes||[]).join(', '),
+      subjNamesText,
+      subjCodesText,
       deptText,
       rangesText,
-      countsText,
+      strengthText,
     ];
   });
 
@@ -1283,14 +1287,55 @@ async function exportAttendanceToPDF() {
   const examDates = state.currentAttendance.examDates;
   
   const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
-  
-  // Add header
-  doc.setFontSize(16);
-  doc.setFont(undefined, 'bold');
-  doc.text(`Department: ${selectedDept}`, doc.internal.pageSize.getWidth() / 2, 15, { align: 'center' });
-  doc.setFontSize(12);
-  doc.text('Overall Attendance Sheet', doc.internal.pageSize.getWidth() / 2, 22, { align: 'center' });
-  doc.setFont(undefined, 'normal');
+
+  // Institution header (same style as summary PDF)
+  if (!state.headerTextLoaded) await loadHeaderTextOnce();
+  const pageWidthA = doc.internal.pageSize.getWidth();
+  const cursorYA = 10;
+  const centerXA = pageWidthA / 2;
+  const nameA = (state.headerText?.name || '').trim();
+  const infoA = (state.headerText?.info || '').trim();
+  const locationA = (state.headerText?.location || '').trim();
+  const imageLeftA = (state.headerText?.imageLeft || '').trim();
+  const imageRightA = (state.headerText?.imageRight || '').trim();
+  let nameYA = cursorYA + 4;
+  if (nameA) { doc.setFontSize(16); doc.setFont(undefined, 'bold'); doc.text(nameA, centerXA, nameYA, { align: 'center' }); }
+  if (infoA) { doc.setFontSize(10); doc.setFont(undefined, 'normal'); doc.text(infoA, centerXA, nameYA + 7, { align: 'center' }); }
+  if (locationA) { doc.setFontSize(12); doc.setFont(undefined, 'bold'); doc.text(locationA, centerXA, nameYA + 14, { align: 'center' }); }
+  const logoWA = 22, logoHA = 22;
+  const gapFromCenterA = 65;
+  const leftXA = centerXA - gapFromCenterA - logoWA;
+  const rightXA = centerXA + gapFromCenterA;
+  const secondLineYA = nameYA + 15;
+  const imgYA = Math.max(0, secondLineYA - logoHA + 1);
+  async function tryAddAnyA(candidates, x){
+    for (const path of candidates){
+      if (!path) continue;
+      try{
+        const res = await fetch(path, { cache: 'no-store' });
+        if (!res.ok) continue;
+        const blob = await res.blob();
+        const dataUrl = await new Promise(r=>{ const fr=new FileReader(); fr.onload=()=>r(fr.result); fr.readAsDataURL(blob); });
+        const fmt = /png/i.test(blob.type) ? 'PNG' : 'JPEG';
+        doc.addImage(dataUrl, fmt, x, imgYA, logoWA, logoHA);
+        return true;
+      }catch(_){ }
+    }
+    return false;
+  }
+  const leftCandidatesA = imageLeftA ? [imageLeftA, `./${imageLeftA}`] : ['1st.jpg','./1st.jpg','1st.png','./1st.png'];
+  const rightCandidatesA = imageRightA ? [imageRightA, `./${imageRightA}`] : ['3rd.jpg','./3rd.jpg','3rd.png','./3rd.png'];
+  await Promise.all([
+    tryAddAnyA(leftCandidatesA, leftXA),
+    tryAddAnyA(rightCandidatesA, rightXA)
+  ]);
+  let headerBottomYA = Math.max(cursorYA + 30, imgYA + logoHA + 6);
+
+  // Titles below institution header
+  doc.setFontSize(16); doc.setFont(undefined, 'bold');
+  doc.text('Overall Attendance Sheet', pageWidthA / 2, headerBottomYA, { align: 'center' });
+  doc.setFontSize(12); doc.setFont(undefined, 'normal');
+  doc.text(`Department: ${selectedDept}`, pageWidthA / 2, headerBottomYA + 8, { align: 'center' });
   
   // Build table data - removed Roll No column
   const headers = [['S.No', 'Register No.', 'Student Name', ...examDates]];
@@ -1308,7 +1353,7 @@ async function exportAttendanceToPDF() {
   const dateColWidth = Math.min(25, Math.max(15, 200 / examDates.length));
   
   doc.autoTable({
-    startY: 30,
+    startY: headerBottomYA + 14,
     head: headers,
     body: [...body, ...footer],
     theme: 'plain',
